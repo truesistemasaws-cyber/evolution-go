@@ -22,6 +22,7 @@ type LabelService interface {
 	ChatUnlabel(data *ChatLabelStruct, instance *instance_model.Instance) error
 	MessageUnlabel(data *MessageLabelStruct, instance *instance_model.Instance) error
 	GetLabels(instance *instance_model.Instance) ([]label_model.Label, error)
+	GetContactsByLabel(instance *instance_model.Instance, label string, limit, offset int) ([]label_model.ContactDTO, error)
 }
 
 type labelService struct {
@@ -223,6 +224,21 @@ func (l *labelService) GetLabels(instance *instance_model.Instance) ([]label_mod
 	}
 
 	return labels, nil
+}
+
+// GetContactsByLabel retorna os contatos associados a uma label para a instância informada.
+func (l *labelService) GetContactsByLabel(instance *instance_model.Instance, label string, limit, offset int) ([]label_model.ContactDTO, error) {
+	_, err := l.ensureClientConnected(instance.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	contacts, err := l.labelRepository.GetContactsByLabel(instance.Id, label, limit, offset)
+	if err != nil {
+		l.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error fetching contacts by label: %v", instance.Id, err)
+		return nil, err
+	}
+	return contacts, nil
 }
 
 func NewLabelService(
