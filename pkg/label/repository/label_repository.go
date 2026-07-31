@@ -13,6 +13,8 @@ type LabelRepository interface {
 	DeleteLabel(id string) error
 	GetAllLabelsByInstanceID(instanceID string) ([]label_model.Label, error)
 	UpsertLabel(label label_model.Label) error
+	// GetContactsByLabel retorna contatos associados a uma label para uma instância (com paginação)
+	GetContactsByLabel(instanceID string, label string, limit, offset int) ([]label_model.ContactDTO, error)
 }
 
 type labelRepository struct {
@@ -64,6 +66,32 @@ func (l *labelRepository) UpsertLabel(label label_model.Label) error {
 		LabelColor:   label.LabelColor,
 		PredefinedId: label.PredefinedId,
 	}).FirstOrCreate(&label).Error
+}
+
+// GetContactsByLabel faz join entre contact_labels e contacts e retorna DTOs.
+func (l *labelRepository) GetContactsByLabel(instanceID string, label string, limit, offset int) ([]label_model.ContactDTO, error) {
+	var contacts []label_model.ContactDTO
+
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	err := l.db.Raw(`
+		SELECT c.id, c.name, c.phone, c.email
+		FROM contacts c
+		JOIN contact_labels cl ON cl.contact_id = c.id
+		WHERE cl.instance_id = ? AND cl.label = ?
+		ORDER BY c.id
+		LIMIT ? OFFSET ?
+	`, instanceID, label, limit, offset).Scan(&contacts).Error
+
+	if err != nil {
+		return nil, err
+	}
+	return contacts, nil
 }
 
 func NewLabelRepository(db *gorm.DB) LabelRepository {
