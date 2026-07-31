@@ -2,6 +2,7 @@ package label_handler
 
 import (
 	"net/http"
+	"strconv"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	label_service "github.com/evolution-foundation/evolution-go/pkg/label/service"
@@ -15,6 +16,7 @@ type LabelHandler interface {
 	ChatUnlabel(ctx *gin.Context)
 	MessageUnlabel(ctx *gin.Context)
 	GetLabels(ctx *gin.Context)
+	GetContactsByLabel(ctx *gin.Context)
 }
 
 type labelHandler struct {
@@ -286,6 +288,56 @@ func (l *labelHandler) GetLabels(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, labels)
+}
+
+// GET /label/contacts?label=<label>&limit=<n>&offset=<n>
+// @Summary Get contacts by label
+// @Description Returns contacts associated with a given label for the authenticated instance
+// @Tags Label
+// @Accept json
+// @Produce json
+// @Param label query string true "Label name"
+// @Param limit query int false "Limit" default(100)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /label/contacts [get]
+func (l *labelHandler) GetContactsByLabel(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+
+	label := ctx.Query("label")
+	if label == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "label is required"})
+		return
+	}
+
+	limit := 100
+	offset := 0
+	if q := ctx.Query("limit"); q != "" {
+		if v, err := strconv.Atoi(q); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	if q := ctx.Query("offset"); q != "" {
+		if v, err := strconv.Atoi(q); err == nil && v >= 0 {
+			offset = v
+		}
+	}
+
+	contacts, err := l.labelService.GetContactsByLabel(instance, label, limit, offset)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"label": label, "contacts": contacts})
 }
 
 func NewLabelHandler(
