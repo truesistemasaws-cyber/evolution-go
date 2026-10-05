@@ -162,18 +162,12 @@ func (c *Config) CreateUsersDB() (*gorm.DB, error) {
 		return nil, err
 	}
 
-	// Configurar pool de conexões no GORM
 	sqlDB, err := db.DB()
 	if err != nil {
 		return nil, fmt.Errorf("erro ao obter sql.DB do GORM: %v", err)
 	}
 
-	// Configurar pool de conexões para evitar conexões ociosas não fechadas
-	sqlDB.SetMaxOpenConns(25)                 // Máximo de 25 conexões abertas simultaneamente
-	sqlDB.SetMaxIdleConns(5)                  // Máximo de 5 conexões ociosas no pool
-	sqlDB.SetConnMaxLifetime(5 * time.Minute) // Reconectar após 5 minutos para evitar timeouts
-	sqlDB.SetConnMaxIdleTime(1 * time.Minute) // Fechar conexões ociosas após 1 minuto
-
+	ConfigureSQLPool(sqlDB, "POSTGRES_USERS_MAX_OPEN_CONNS", 15)
 	return db, nil
 }
 
@@ -193,11 +187,7 @@ func (c *Config) CreateAuthDB() (*sql.DB, error) {
 		return nil, err
 	}
 
-	// Configurar pool de conexões para evitar conexões ociosas não fechadas
-	db.SetMaxOpenConns(25)                 // Máximo de 25 conexões abertas simultaneamente
-	db.SetMaxIdleConns(5)                  // Máximo de 5 conexões ociosas no pool
-	db.SetConnMaxLifetime(5 * time.Minute) // Reconectar após 5 minutos para evitar timeouts
-	db.SetConnMaxIdleTime(1 * time.Minute) // Fechar conexões ociosas após 1 minuto
+	ConfigureSQLPool(db, "POSTGRES_AUTH_MAX_OPEN_CONNS", 20)
 
 	// Testar a conexão
 	err = db.Ping()
@@ -206,6 +196,33 @@ func (c *Config) CreateAuthDB() (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+// ConfigureSQLPool caps a Postgres pool. Both the users pool and the auth pool
+// (also used by whatsmeow) hit the same server, so the defaults stay well under
+// a 100-connection limit even with one extra replica. Override with the named
+// env var; values outside 1..50 are ignored.
+func ConfigureSQLPool(db *sql.DB, openEnv string, defaultOpen int) {
+	open := envInt(openEnv, defaultOpen, 1, 50)
+	idle := envInt("POSTGRES_MAX_IDLE_CONNS", 4, 1, open)
+	db.SetMaxOpenConns(open)
+	db.SetMaxIdleConns(idle)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(time.Minute)
+	logger.LogInfo("[CONFIG] Postgres pool %s maxOpen=%d maxIdle=%d", openEnv, open, idle)
+}
+
+func envInt(key string, fallback, min, max int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < min || n > max {
+		logger.LogWarn("[CONFIG] Ignoring %s=%q; using %d", key, raw, fallback)
+		return fallback
+	}
+	return n
 }
 
 func Load() *Config {

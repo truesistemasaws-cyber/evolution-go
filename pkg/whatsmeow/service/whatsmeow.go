@@ -98,6 +98,15 @@ type whatsmeowService struct {
 	loggerWrapper      *logger_wrapper.LoggerManager
 	passkeyCeremony    *ceremony.Store
 	deviceContainer    *deviceContainerHolder
+	runs               *instanceRuns
+}
+
+// instanceRuns makes sure one instance has a single live StartClient. A newer
+// StartInstance bumps the generation so an older loop cannot restart itself.
+type instanceRuns struct {
+	mu        sync.Mutex
+	gen       map[string]uint64
+	activeGen map[string]uint64
 }
 
 // deviceContainerHolder shares one whatsmeow device container across all clients.
@@ -158,6 +167,7 @@ type ClientData struct {
 	Subscriptions []string
 	Phone         string
 	IsProxy       bool
+	Generation    uint64
 }
 
 type Values struct {
@@ -341,17 +351,65 @@ func (w whatsmeowService) getDeviceContainer() (*sqlstore.Container, error) {
 	return container, nil
 }
 
-func (w whatsmeowService) StartClient(cd *ClientData) {
+func newInstanceRuns() *instanceRuns {
+	return &instanceRuns{
+		gen:       map[string]uint64{},
+		activeGen: map[string]uint64{},
+	}
+}
 
-	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
+func (w whatsmeowService) bumpGen(id string) uint64 {
+	w.runs.mu.Lock()
+	defer w.runs.mu.Unlock()
+	w.runs.gen[id]++
+	return w.runs.gen[id]
+}
+
+func (w whatsmeowService) currentGen(id string) uint64 {
+	w.runs.mu.Lock()
+	defer w.runs.mu.Unlock()
+	return w.runs.gen[id]
+}
+
+func (w whatsmeowService) claimRun(id string, gen uint64) bool {
+	w.runs.mu.Lock()
+	defer w.runs.mu.Unlock()
+	if w.runs.gen[id] != gen || w.runs.activeGen[id] == gen {
+		return false
+	}
+	w.runs.activeGen[id] = gen
+	return true
+}
+
+func (w whatsmeowService) releaseRun(id string, gen uint64) {
+	w.runs.mu.Lock()
+	defer w.runs.mu.Unlock()
+	if w.runs.activeGen[id] == gen {
+		delete(w.runs.activeGen, id)
+	}
+}
+
+func (w whatsmeowService) StartClient(cd *ClientData) {
+	id := cd.Instance.Id
+	if !w.claimRun(id, cd.Generation) {
+		w.loggerWrapper.GetLogger(id).LogInfo("[%s] StartClient skipped; this session is no longer current", id)
+		return
+	}
+	defer w.releaseRun(id, cd.Generation)
+
+	killCh := w.killChannel[id]
+	if killCh == nil {
+		w.loggerWrapper.GetLogger(id).LogError("[%s] StartClient aborted; kill channel is missing", id)
+		return
+	}
+
+	w.loggerWrapper.GetLogger(id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", id)
 
 	var deviceStore *store.Device
 	var err error
 
-	if w.clientPointer[cd.Instance.Id] != nil {
-		if w.clientPointer[cd.Instance.Id].IsConnected() {
-			return
-		}
+	if w.clientPointer[id] != nil && w.clientPointer[id].IsConnected() && w.currentGen(id) == cd.Generation {
+		return
 	}
 
 	container, err := w.getDeviceContainer()
@@ -596,12 +654,14 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	for {
 		select {
-		case <-w.killChannel[cd.Instance.Id]:
+		case <-killCh:
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
 			client.Disconnect()
 
-			delete(w.clientPointer, cd.Instance.Id)
-			delete(w.myClientPointer, cd.Instance.Id)
+			if w.killChannel[cd.Instance.Id] == killCh {
+				delete(w.clientPointer, cd.Instance.Id)
+				delete(w.myClientPointer, cd.Instance.Id)
+			}
 
 			// Limpar cache de userInfo para esta instância
 			w.userInfoCache.Delete(cd.Instance.Token)
@@ -646,12 +706,19 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
 			}
 
-			// restart client
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
-			w.StartClient(cd)
+			// A paired session comes back on its own. An unpaired one stops here:
+			// QRTimeout already fired, and restarting would loop forever.
+			if cd.Instance.Jid != "" && w.currentGen(id) == cd.Generation {
+				w.loggerWrapper.GetLogger(id).LogInfo("[%s] Scheduling reconnect in 5s", id)
+				go func() {
+					time.Sleep(5 * time.Second)
+					w.StartClient(cd)
+				}()
+			} else if cd.Instance.Jid == "" {
+				w.loggerWrapper.GetLogger(id).LogInfo("[%s] Pairing stopped after QR timeout; connect again to retry", id)
+			}
 			return
-		default:
-			time.Sleep(1000 * time.Millisecond)
+		case <-time.After(time.Second):
 		}
 	}
 }
@@ -2404,13 +2471,23 @@ func (w whatsmeowService) StartInstance(instanceId string) error {
 		}
 	}
 
-	w.killChannel[instance.Id] = make(chan bool)
+	if client, exists := w.clientPointer[instance.Id]; exists && client != nil {
+		client.Disconnect()
+	}
+	if ch, exists := w.killChannel[instance.Id]; exists {
+		select {
+		case ch <- true:
+		default:
+		}
+	}
+	w.killChannel[instance.Id] = make(chan bool, 1)
 
 	clientData := &ClientData{
 		Instance:      instance,
 		Subscriptions: subscribedEvents,
 		Phone:         "",
 		IsProxy:       false,
+		Generation:    w.bumpGen(instance.Id),
 	}
 
 	if instance.Proxy != "" {
@@ -2452,7 +2529,10 @@ func (w whatsmeowService) ConnectOnStartup(clientName string) {
 
 	w.loggerWrapper.GetLogger(clientName).LogInfo("[%s] Found %d connected instances", clientName, len(instances))
 
-	for _, instance := range instances {
+	for i, instance := range instances {
+		if i > 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
 		w.loggerWrapper.GetLogger(clientName).LogInfo("[%s] Starting client for user '%s'", clientName, instance.Id)
 
 		err := w.StartInstance(instance.Id)
@@ -2854,6 +2934,7 @@ func NewWhatsmeowService(
 		loggerWrapper:      loggerWrapper,
 		passkeyCeremony:    ceremony.NewStore(),
 		deviceContainer:    &deviceContainerHolder{},
+		runs:               newInstanceRuns(),
 	}
 }
 
